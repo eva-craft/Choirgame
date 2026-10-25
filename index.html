@@ -381,9 +381,15 @@ const floorEl = document.getElementById('floor');
    ============================================================ */
 function makeSinger(type, opts={}) {
   const v = VOICE_TYPES[type];
-  const s = { id: state.nextId++, type, skill: opts.skill ?? (15 + Math.random()*25), x:0, y:0, singingTimer:null };
+  const s = {
+    id: state.nextId++, type,
+    skill: opts.skill ?? (15 + Math.random()*25),
+    form: opts.form ?? 60 + Math.random()*20,
+    x:0, y:0, singingTimer:null, regenTimer:null,
+  };
   state.singers.push(s);
   renderSinger(s);
+  startFormRegen(s);
   placeSingers();
   return s;
 }
@@ -398,7 +404,7 @@ function renderSinger(s) {
       <div class="torso"></div>
     </div>
     <div class="voice">${v.name}</div>
-    <div class="lvl">ур. <span class="lvlnum">${Math.round(s.skill)}</span></div>
+    <div class="lvl">форма <span class="lvlnum">${Math.round(s.form)}</span></div>
     <div class="lvlbar"><div></div></div>`;
   el.dataset.id = s.id;
   el.addEventListener('click', () => upgradeSinger(s.id));
@@ -410,8 +416,14 @@ function renderSinger(s) {
 }
 function updateSingerVisual(s) {
   if (!s.el) return;
-  s.el.querySelector('.lvlnum').textContent = Math.round(s.skill);
-  s.el.querySelector('.lvlbar > div').style.width = s.skill + '%';
+  s.el.querySelector('.lvlnum').textContent = Math.round(s.form);
+  const bar = s.el.querySelector('.lvlbar > div');
+  bar.style.width = s.form + '%';
+  const color = s.form > 60 ? 'linear-gradient(90deg,#4caf50,#a5d6a7)'
+              : s.form > 30 ? 'linear-gradient(90deg,#e0a020,#ffd700)'
+              : 'linear-gradient(90deg,#c02020,#ff6666)';
+  bar.style.background = color;
+  s.el.classList.toggle('tired', s.form < 25);
 }
 function placeSingers() {
   const n = state.singers.length; if (!n) return;
@@ -442,17 +454,44 @@ function animateSinging(s, durMs) {
     { duration: Math.min(700, durMs), easing:'ease-in-out' }
   );
 }
+const FORM_MAX = 100;
+const FORM_DECAY_PER_NOTE = { gold: 0.3, silver: 0.6, red: 1.2, missed: 0 };
+
 function upgradeSinger(id) {
   const s = state.singers.find(x => x.id === id); if (!s) return;
-  const cost = 5 + Math.floor(s.skill/10);
-  if (state.coins < cost) { log('Не хватает монет!'); return; }
-  if (s.skill >= 100) { log('Этот певец уже мастер!'); return; }
-  state.coins -= cost;
-  const gain = 3 + state.reputation * 0.6;
-  s.skill = Math.min(100, s.skill + gain);
-  updateSingerVisual(s); updateHUD();
-  log(`${VOICE_TYPES[s.type].name} +${gain.toFixed(1)} (${cost} монет)`);
-  s.el.animate([{transform:'scale(1)'},{transform:'scale(1.2)'},{transform:'scale(1)'}],{duration:260});
+  if (s.form >= FORM_MAX) { log('Певец в отличной форме!'); return; }
+  const gain = 5 + state.reputation * 0.4;
+  s.form = Math.min(FORM_MAX, s.form + gain);
+  updateSingerVisual(s);
+  showFormPop(s, `+${gain.toFixed(0)}`);
+  log(`${VOICE_TYPES[s.type].name}: форма +${gain.toFixed(0)}`);
+  s.el.animate([{transform:'scale(1)'},{transform:'scale(1.15)'},{transform:'scale(1)'}],{duration:220});
+}
+
+function decayForm(s, result) {
+  const drop = FORM_DECAY_PER_NOTE[result] ?? 1;
+  s.form = Math.max(0, s.form - drop);
+  updateSingerVisual(s);
+}
+
+function startFormRegen(s) {
+  clearInterval(s.regenTimer);
+  s.regenTimer = setInterval(() => {
+    if (state.playing) return;
+    if (s.form >= FORM_MAX) return;
+    s.form = Math.min(FORM_MAX, s.form + 0.3);
+    updateSingerVisual(s);
+  }, 1000);
+}
+
+function showFormPop(s, text) {
+  const el = document.createElement('div');
+  el.className = 'note-pop';
+  el.style.cssText = `left:${s.x + 24}px;top:${s.y + 4}px;color:#7dff9b;
+    font-size:12px;font-weight:bold;text-shadow:0 0 6px #2aff6a,0 0 2px #000;`;
+  el.textContent = text;
+  floorEl.appendChild(el);
+  setTimeout(() => el.remove(), 900);
 }
 function fireSinger(id) {
   const idx = state.singers.findIndex(x => x.id === id); if (idx < 0) return;
@@ -795,6 +834,7 @@ function startSong() {
   state.playing = true;
   state.currentSong = SONGS[state.songIndex];
   state.results = [];
+  state.singers.forEach(s => { s.form = Math.min(100, s.form + 8); updateSingerVisual(s); });
   state.starsEarned = 0;
   state.partyResults = { S:{gold:0,silver:0,red:0,missed:0}, A:{gold:0,silver:0,red:0,missed:0}, T:{gold:0,silver:0,red:0,missed:0}, B:{gold:0,silver:0,red:0,missed:0} };
 
@@ -834,23 +874,38 @@ function startSong() {
     const durMs = d * beatMs;
     const singer = pickSingerForParty(party);
     let result;
-    if (!singer) {
+        if (!singer) {
       result = RESULT.MISSED;
       state.partyResults[party].missed++;
       colorScoreNote(party, barIdx, noteInBar, RESULT_COLORS.missed);
-    } else {
-      const sf = singer.skill / 100;
+       } else {
+      // Форма — главный фактор. skill даёт небольшой бонус сверху,
+      // но при form=100 результат гарантированно золотой.
+      const f = singer.form / 100;
+const isPerfect = singer.form >= 99.5;   // допуск на дробный decay
+let goldChance;
+if (isPerfect) {
+  goldChance = 1;
+} else {
+  goldChance = Math.pow(f, 2.2);
+}
+      const silverChance = (1 - goldChance) * 0.9;    // остаток почти весь в серебро
+
       const roll = Math.random();
-      if (roll < sf * 0.65) result = RESULT.GOLD;
-      else if (roll < sf * 0.65 + (1 - sf) * 0.5 + 0.2) result = RESULT.SILVER;
+      if (roll < goldChance) result = RESULT.GOLD;
+      else if (roll < goldChance + silverChance) result = RESULT.SILVER;
       else result = RESULT.RED;
-      if (result === RESULT.GOLD && state.reputation < 5 && Math.random() < 0.35) result = RESULT.SILVER;
+
+      // Штраф репутации — мягче и только при действительно низкой репутации
+      if (result === RESULT.GOLD && state.reputation < 3 && Math.random() < 0.15) {
+        result = RESULT.SILVER;
+      }
 
       state.partyResults[party][result]++;
       showNoteAbove(singer, midiToName(v), RESULT_COLORS[result]);
       animateSinging(singer, durMs);
       colorScoreNote(party, barIdx, noteInBar, RESULT_COLORS[result]);
-      // ▶ ЗВУК: хоровая гласная партии
+      decayForm(singer, result);
       playChoir(v, durMs / 1000, result, party);
     }
     state.results.push(result);
